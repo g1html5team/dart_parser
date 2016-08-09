@@ -1,0 +1,15 @@
+name: 'dart_parser'
+version: 0.0.1
+description: Dart parser
+#author: Xavier Hainaux <email@example.com>
+#homepage: https://www.example.com
+
+environment:
+  sdk: '>=1.0.0 <2.0.0'
+
+dependencies:
+  browser: '>=0.10.0 <0.11.0'
+  charcode: ^1.1.0
+  path: '>=0.9.0 <2.0.0'
+  yaml: ^2.1.2
+  package_config: '>=0.1.5 <2.0.0'
