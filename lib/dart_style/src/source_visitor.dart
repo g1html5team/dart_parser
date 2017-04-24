@@ -133,7 +133,7 @@ class SourceVisitor implements AstVisitor {
   /// 4. Split between one or more positional arguments, trying to keep as many
   ///    on earlier lines as possible.
   /// 5. Split the named arguments each onto their own line.
-  visitArgumentList(ArgumentList node) {
+  visitArgumentList(ArgumentList node, {bool nestExpression: true}) {
     // Corner case: handle empty argument lists.
     if (node.arguments.isEmpty) {
       token(node.leftParenthesis);
@@ -154,17 +154,39 @@ class SourceVisitor implements AstVisitor {
       return;
     }
 
+    if (nestExpression) builder.nestExpression();
     new ArgumentListVisitor(this, node).visit();
+    if (nestExpression) builder.unnest();
   }
 
   visitAsExpression(AsExpression node) {
     builder.startSpan();
+    builder.nestExpression();
     visit(node.expression);
     soloSplit();
     token(node.asOperator);
     space();
     visit(node.type);
+    builder.unnest();
     builder.endSpan();
+  }
+
+  // TODO(rnystrom): Type annotate once analyzer publishes a version with the
+  // new AST type.
+  // TODO(rnystrom): Test.
+  visitAssertInitializer(node) {
+    _simpleStatement(node, () {
+      token(node.assertKeyword);
+
+      var arguments = <Expression>[node.condition];
+      if (node.message != null) arguments.add(node.message);
+
+      builder.nestExpression();
+      var visitor = new ArgumentListVisitor.forArguments(
+          this, node.leftParenthesis, node.rightParenthesis, arguments);
+      visitor.visit();
+      builder.unnest();
+    });
   }
 
   visitAssertStatement(AssertStatement node) {
@@ -318,6 +340,16 @@ class SourceVisitor implements AstVisitor {
   }
 
   visitCascadeExpression(CascadeExpression node) {
+    var splitIfOperandsSplit =
+        node.cascadeSections.length > 1 || _isCollectionLike(node.target);
+
+    // If the cascade sections have consistent names they can be broken
+    // normally otherwise they always get their own line.
+    if (splitIfOperandsSplit) {
+      builder.startLazyRule(
+          _allowInlineCascade(node) ? new Rule() : new Rule.hard());
+    }
+
     // If the target of the cascade is a method call (or chain of them), we
     // treat the nesting specially. Normally, you would end up with:
     //
@@ -346,17 +378,22 @@ class SourceVisitor implements AstVisitor {
     builder.nestExpression(indent: Indent.cascade, now: true);
     builder.startBlockArgumentNesting();
 
-    // If the cascade sections have consistent names they can be broken
-    // normally otherwise they always get their own line.
-    if (_allowInlineCascade(node.cascadeSections)) {
-      builder.startRule();
-      zeroSplit();
-      visitNodes(node.cascadeSections, between: zeroSplit);
+    // If the cascade section shouldn't cause the cascade to split, end the
+    // rule early so it isn't affected by it.
+    if (!splitIfOperandsSplit) {
+      builder
+          .startRule(_allowInlineCascade(node) ? new Rule() : new Rule.hard());
+    }
+
+    zeroSplit();
+
+    if (!splitIfOperandsSplit) {
       builder.endRule();
-    } else {
-      builder.startRule(new Rule.hard());
-      zeroSplit();
-      visitNodes(node.cascadeSections, between: zeroSplit);
+    }
+
+    visitNodes(node.cascadeSections, between: zeroSplit);
+
+    if (splitIfOperandsSplit) {
       builder.endRule();
     }
 
@@ -366,16 +403,62 @@ class SourceVisitor implements AstVisitor {
     if (node.target is MethodInvocation) builder.unnest();
   }
 
+  /// Whether [expression] is a collection literal, or a call with a trailing
+  /// comma in an argument list.
+  ///
+  /// In that case, when the expression is a target of a cascade, we don't
+  /// force a split before the ".." as eagerly to avoid ugly results like:
+  ///
+  ///     [
+  ///       1,
+  ///       2,
+  ///     ]..addAll(numbers);
+  bool _isCollectionLike(Expression expression) {
+    if (expression is ListLiteral) return false;
+    if (expression is MapLiteral) return false;
+
+    // If the target is a call with a trailing comma in the argument list,
+    // treat it like a collection literal.
+    ArgumentList arguments;
+    if (expression is InvocationExpression) {
+      arguments = expression.argumentList;
+    } else if (expression is InstanceCreationExpression) {
+      arguments = expression.argumentList;
+    }
+
+    // TODO(rnystrom): Do we want to allow an invocation where the last
+    // argument is a collection literal? Like:
+    //
+    //     foo(argument, [
+    //       element
+    //     ])..cascade();
+
+    return arguments == null ||
+        arguments.arguments.isEmpty ||
+        arguments.arguments.last.endToken.next.type != TokenType.COMMA;
+  }
+
   /// Whether a cascade should be allowed to be inline as opposed to one
   /// expression per line.
-  bool _allowInlineCascade(List<Expression> sections) {
-    if (sections.length < 2) return true;
+  bool _allowInlineCascade(CascadeExpression node) {
+    // If the receiver is an expression that makes the cascade's very low
+    // precedence confusing, force it to split. For example:
+    //
+    //     a ? b : c..d();
+    //
+    // Here, the cascade is applied to the result of the conditional, not "c".
+    if (node.target is ConditionalExpression) return false;
+    if (node.target is BinaryExpression) return false;
+    if (node.target is PrefixExpression) return false;
+    if (node.target is AwaitExpression) return false;
+
+    if (node.cascadeSections.length < 2) return true;
 
     var name;
     // We could be more forgiving about what constitutes sections with
     // consistent names but for now we require all sections to have the same
     // method name.
-    for (var expression in sections) {
+    for (var expression in node.cascadeSections) {
       if (expression is MethodInvocation) {
         if (name == null) {
           name = expression.methodName.name;
@@ -609,7 +692,7 @@ class SourceVisitor implements AstVisitor {
     // the parameter list gets more deeply indented.
     if (node.redirectedConstructor != null) builder.nestExpression();
 
-    _visitBody(node.parameters, node.body, () {
+    _visitBody(null, node.parameters, node.body, () {
       // Check for redirects or initializer lists.
       if (node.redirectedConstructor != null) {
         _visitConstructorRedirects(node);
@@ -759,13 +842,18 @@ class SourceVisitor implements AstVisitor {
     space();
 
     _beginBody(node.leftBracket, space: true);
-    visitCommaSeparatedNodes(node.constants, between: split);
+    visitCommaSeparatedNodes(node.constants, between: splitOrTwoNewlines);
+
+    // If there is a trailing comma, always force the constants to split.
+    if (node.constants.last.endToken.next.type == TokenType.COMMA) {
+      builder.forceRules();
+    }
+
     _endBody(node.rightBracket, space: true);
   }
 
   visitExportDirective(ExportDirective node) {
-    visitMetadata(node.metadata);
-
+    _visitDirectiveMetadata(node);
     _simpleStatement(node, () {
       token(node.keyword);
       space();
@@ -837,12 +925,16 @@ class SourceVisitor implements AstVisitor {
 
   visitFieldFormalParameter(FieldFormalParameter node) {
     visitParameterMetadata(node.metadata, () {
+      builder.startLazyRule(new Rule(Cost.parameterType));
+      builder.nestExpression();
       token(node.keyword, after: space);
-      visit(node.type, after: space);
+      visit(node.type, after: split);
       token(node.thisKeyword);
       token(node.period);
       visit(node.identifier);
       visit(node.parameters);
+      builder.unnest();
+      builder.endRule();
     });
   }
 
@@ -867,7 +959,8 @@ class SourceVisitor implements AstVisitor {
     _visitLoopBody(node.body);
   }
 
-  visitFormalParameterList(FormalParameterList node) {
+  visitFormalParameterList(FormalParameterList node,
+      {bool nestExpression: true}) {
     // Corner case: empty parameter lists.
     if (node.parameters.isEmpty) {
       token(node.leftParenthesis);
@@ -894,7 +987,7 @@ class SourceVisitor implements AstVisitor {
         .where((param) => param is DefaultFormalParameter)
         .toList();
 
-    builder.nestExpression();
+    if (nestExpression) builder.nestExpression();
     token(node.leftParenthesis);
 
     _metadataRules.add(new MetadataRule());
@@ -969,7 +1062,7 @@ class SourceVisitor implements AstVisitor {
     _metadataRules.removeLast();
 
     token(node.rightParenthesis);
-    builder.unnest();
+    if (nestExpression) builder.unnest();
   }
 
   visitForStatement(ForStatement node) {
@@ -1039,7 +1132,20 @@ class SourceVisitor implements AstVisitor {
   }
 
   visitFunctionExpression(FunctionExpression node) {
-    _visitBody(node.parameters, node.body);
+    // TODO(rnystrom): This is working but not tested. As of 2016/11/29, the
+    // latest version of analyzer on pub does not parse generic lambdas. When
+    // a version of it that does is published, upgrade dart_style to use it and
+    // then test it:
+    //
+    //     >>> generic function expression
+    //         main() {
+    //           var generic = < T,S >(){};
+    //     }
+    //     <<<
+    //     main() {
+    //       var generic = <T, S>() {};
+    //     }
+    _visitBody(node.typeParameters, node.parameters, node.body);
   }
 
   visitFunctionExpressionInvocation(FunctionExpressionInvocation node) {
@@ -1067,7 +1173,7 @@ class SourceVisitor implements AstVisitor {
       // Try to keep the function's parameters with its name.
       builder.startSpan();
       visit(node.identifier);
-      visit(node.parameters);
+      _visitParameterSignature(node.typeParameters, node.parameters);
       builder.endSpan();
     });
   }
@@ -1133,8 +1239,7 @@ class SourceVisitor implements AstVisitor {
   }
 
   visitImportDirective(ImportDirective node) {
-    visitMetadata(node.metadata);
-
+    _visitDirectiveMetadata(node);
     _simpleStatement(node, () {
       token(node.keyword);
       space();
@@ -1183,7 +1288,7 @@ class SourceVisitor implements AstVisitor {
       soloZeroSplit();
     }
 
-    builder.startSpan();
+    builder.startSpan(Cost.index);
     token(node.leftBracket);
     soloZeroSplit();
     visit(node.index);
@@ -1196,10 +1301,18 @@ class SourceVisitor implements AstVisitor {
     token(node.keyword);
     space();
     builder.startSpan(Cost.constructorName);
+
+    // Start the expression nesting for the argument list here, in case this
+    // is a generic constructor with type arguments. If it is, we need the type
+    // arguments to be nested too so they get indented past the arguments.
+    builder.nestExpression();
     visit(node.constructorName);
+
     builder.endSpan();
-    visit(node.argumentList);
+    visitArgumentList(node.argumentList, nestExpression: false);
     builder.endSpan();
+
+    builder.unnest();
   }
 
   visitIntegerLiteral(IntegerLiteral node) {
@@ -1218,12 +1331,14 @@ class SourceVisitor implements AstVisitor {
 
   visitIsExpression(IsExpression node) {
     builder.startSpan();
+    builder.nestExpression();
     visit(node.expression);
     soloSplit();
     token(node.isOperator);
     token(node.notOperator);
     space();
     visit(node.type);
+    builder.unnest();
     builder.endSpan();
   }
 
@@ -1238,8 +1353,7 @@ class SourceVisitor implements AstVisitor {
   }
 
   visitLibraryDirective(LibraryDirective node) {
-    visitMetadata(node.metadata);
-
+    _visitDirectiveMetadata(node);
     _simpleStatement(node, () {
       token(node.keyword);
       space();
@@ -1289,8 +1403,21 @@ class SourceVisitor implements AstVisitor {
 
       // This will be non-null for cascade sections.
       token(node.operator);
-      token(node.methodName.token);
-      visit(node.argumentList);
+      visit(node.methodName);
+
+      // TODO(rnystrom): Currently, there are no constraints between a generic
+      // method's type arguments and arguments. That can lead to some funny
+      // splitting like:
+      //
+      //     method<VeryLongType,
+      //             AnotherTypeArgument>(argument,
+      //         argument, argument, argument);
+      //
+      // The indentation is fine, but splitting in the middle of each argument
+      // list looks kind of strange. If this ends up happening in real world
+      // code, consider putting a constraint between them.
+      visit(node.typeArguments);
+      visitArgumentList(node.argumentList, nestExpression: false);
 
       builder.unnest();
       builder.endSpan();
@@ -1306,8 +1433,7 @@ class SourceVisitor implements AstVisitor {
 
   visitNativeClause(NativeClause node) {
     token(node.nativeKeyword);
-    space();
-    visit(node.name);
+    visit(node.name, before: space);
   }
 
   visitNativeFunctionBody(NativeFunctionBody node) {
@@ -1315,8 +1441,7 @@ class SourceVisitor implements AstVisitor {
       builder.nestExpression(now: true);
       soloSplit();
       token(node.nativeKeyword);
-      space();
-      visit(node.stringLiteral);
+      visit(node.stringLiteral, before: space);
       builder.unnest();
     });
   }
@@ -1334,8 +1459,7 @@ class SourceVisitor implements AstVisitor {
   }
 
   visitPartDirective(PartDirective node) {
-    visitMetadata(node.metadata);
-
+    _visitDirectiveMetadata(node);
     _simpleStatement(node, () {
       token(node.keyword);
       space();
@@ -1344,8 +1468,7 @@ class SourceVisitor implements AstVisitor {
   }
 
   visitPartOfDirective(PartOfDirective node) {
-    visitMetadata(node.metadata);
-
+    _visitDirectiveMetadata(node);
     _simpleStatement(node, () {
       token(node.keyword);
       space();
@@ -1367,10 +1490,11 @@ class SourceVisitor implements AstVisitor {
   visitPrefixExpression(PrefixExpression node) {
     token(node.operator);
 
-    // Corner case: put a space between successive "-" operators so we don't
-    // inadvertently turn them into a "--" decrement operator.
-    if (node.operand is PrefixExpression &&
-        (node.operand as PrefixExpression).operator.lexeme == "-") {
+    // Edge case: put a space after "-" if the operand is "-" or "--" so we
+    // don't merge the operators.
+    var operand = node.operand;
+    if (operand is PrefixExpression &&
+        (operand.operator.lexeme == "-" || operand.operator.lexeme == "--")) {
       space();
     }
 
@@ -1424,9 +1548,20 @@ class SourceVisitor implements AstVisitor {
 
   visitSimpleFormalParameter(SimpleFormalParameter node) {
     visitParameterMetadata(node.metadata, () {
+      builder.startLazyRule(new Rule(Cost.parameterType));
+      builder.nestExpression();
       modifier(node.keyword);
-      visit(node.type, after: space);
+
+      visit(node.type);
+
+      // In function declarations and the old typedef syntax, you can have a
+      // parameter name without a type. In the new syntax, you can have a type
+      // without a name. Handle both cases.
+      if (node.type != null && node.identifier != null) split();
+
       visit(node.identifier);
+      builder.unnest();
+      builder.endRule();
     });
   }
 
@@ -1671,11 +1806,25 @@ class SourceVisitor implements AstVisitor {
     if (after != null) after();
   }
 
-  /// Visit metadata annotations on directives, declarations, and members.
+  /// Visit metadata annotations on declarations, and members.
   ///
   /// These always force the annotations to be on the previous line.
   void visitMetadata(NodeList<Annotation> metadata) {
     visitNodes(metadata, between: newline, after: newline);
+  }
+
+  /// Visit metadata annotations for a directive.
+  ///
+  /// Always force the annotations to be on a previous line.
+  void _visitDirectiveMetadata(Directive directive) {
+    // Preserve a blank line before the first directive since users (in
+    // particular the test package) sometimes use that for metadata that
+    // applies to the entire library and not the following directive itself.
+    var isFirst =
+        directive == (directive.parent as CompilationUnit).directives.first;
+
+    visitNodes(directive.metadata,
+        between: newline, after: isFirst ? oneOrTwoNewlines : newline);
   }
 
   /// Visits metadata annotations on parameters and type parameters.
@@ -1765,7 +1914,7 @@ class SourceVisitor implements AstVisitor {
   void _visitGenericList(
       Token leftBracket, Token rightBracket, List<AstNode> nodes) {
     var rule = new TypeArgumentRule();
-    builder.startRule(rule);
+    builder.startLazyRule(rule);
     builder.startSpan();
     builder.nestExpression();
 
@@ -1815,7 +1964,14 @@ class SourceVisitor implements AstVisitor {
     visit(node.name);
     builder.endSpan();
 
-    _visitBody(function.parameters, function.body, () {
+    TypeParameterList typeParameters;
+    if (node is FunctionDeclaration) {
+      typeParameters = node.functionExpression.typeParameters;
+    } else {
+      typeParameters = (node as MethodDeclaration).typeParameters;
+    }
+
+    _visitBody(typeParameters, function.parameters, function.body, () {
       // If the body is a block, we need to exit nesting before we hit the body
       // indentation, but we do want to wrap it around the parameters.
       if (function.body is! ExpressionFunctionBody) builder.unnest();
@@ -1830,7 +1986,8 @@ class SourceVisitor implements AstVisitor {
   /// space before it if it's not empty.
   ///
   /// If [beforeBody] is provided, it is invoked before the body is visited.
-  void _visitBody(FormalParameterList parameters, FunctionBody body,
+  void _visitBody(TypeParameterList typeParameters,
+      FormalParameterList parameters, FunctionBody body,
       [beforeBody()]) {
     // If the body is "=>", add an extra level of indentation around the
     // parameters and a rule that spans the parameters and the "=>". This
@@ -1862,12 +2019,28 @@ class SourceVisitor implements AstVisitor {
       builder.startLazyRule(new Rule(Cost.arrow));
     }
 
-    if (parameters != null) visit(parameters);
+    _visitParameterSignature(typeParameters, parameters);
 
     if (beforeBody != null) beforeBody();
     visit(body);
 
     if (body is ExpressionFunctionBody) builder.unnest();
+  }
+
+  /// Visits the type parameters (if any) and formal parameters of a method
+  /// declaration, function declaration, or generic function type.
+  void _visitParameterSignature(
+      TypeParameterList typeParameters, FormalParameterList parameters) {
+    // Start the nesting for the parameters here, so they wrap around the
+    // type parameters too, if any.
+    builder.nestExpression();
+
+    visit(typeParameters);
+    if (parameters != null) {
+      visitFormalParameterList(parameters, nestExpression: false);
+    }
+
+    builder.unnest();
   }
 
   /// Visits the body statement of a `for`, `for in`, or `while` loop.
@@ -2037,6 +2210,8 @@ class SourceVisitor implements AstVisitor {
     // Can't have a trailing comma if there are no parameters.
     assert(parameters.parameters.isNotEmpty);
 
+    _metadataRules.add(new MetadataRule());
+
     // Always split the parameters.
     builder.startRule(new Rule.hard());
 
@@ -2061,7 +2236,6 @@ class SourceVisitor implements AstVisitor {
     builder = builder.startBlock(null);
 
     for (var parameter in parameters.parameters) {
-      builder.nestExpression();
       visit(parameter);
 
       // The comma after the parameter.
@@ -2077,7 +2251,6 @@ class SourceVisitor implements AstVisitor {
         lastRequired = null;
       }
 
-      builder.unnest();
       newline();
     }
 
@@ -2087,6 +2260,8 @@ class SourceVisitor implements AstVisitor {
     writePrecedingCommentsAndNewlines(firstDelimiter);
     builder = builder.endBlock(null, forceSplit: true);
     builder.endRule();
+
+    _metadataRules.removeLast();
 
     // Now write the delimiter itself.
     _writeText(firstDelimiter.lexeme, firstDelimiter.offset);
@@ -2330,6 +2505,13 @@ class SourceVisitor implements AstVisitor {
   /// between the last token and the next one.
   void splitOrNewline() {
     builder.writeWhitespace(Whitespace.splitOrNewline);
+  }
+
+  /// Allow either a single split or newline to be emitted before the next
+  /// non-whitespace token based on whether a newline exists in the source
+  /// between the last token and the next one.
+  void splitOrTwoNewlines() {
+    builder.writeWhitespace(Whitespace.splitOrTwoNewlines);
   }
 
   /// Allow either one or two newlines to be emitted before the next
