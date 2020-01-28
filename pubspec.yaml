@@ -3,7 +3,7 @@ version: 1.0.1
 description: Dart parser
 
 environment:
-  sdk: '>2.0.0'
+  sdk: '>=2.7.0 <3.0.0'
 
 dependencies:
   charcode: ^1.1.0
